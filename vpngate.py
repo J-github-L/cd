@@ -134,7 +134,16 @@ EDGE_HOSTS = [h.strip() for h in env_str("EDGE_HOSTS", _DEFAULT_EDGE).split(",")
 # 优选 API 地址 (逗号分隔可多个)
 OPTIMAL_API = env_str("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
 
-NODES_URL = env_str("NODES_URL", "https://J-github-L.github.io/cd/nodes.txt")
+def _default_nodes_url():
+    """在 GitHub Actions 中按 GITHUB_REPOSITORY 自动生成 Pages 订阅地址"""
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        return f"https://{owner.lower()}.github.io/{name}/nodes.txt"
+    return "https://YOUR_GITHUB_USERNAME.github.io/YOUR_REPO/nodes.txt"
+
+
+NODES_URL = env_str("NODES_URL", _default_nodes_url())
 
 
 # ---------------------------------------------------------------------------
