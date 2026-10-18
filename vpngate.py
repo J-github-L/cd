@@ -24,7 +24,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -58,7 +58,29 @@ VPNGATE_MIRROR = env_str(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-WORKER_CHECK_URL = env_str("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
+
+
+def normalize_worker_url(raw):
+    """兼容 Secret 只填域名的情况, 自动补全 scheme / 路径 / 查询参数。
+
+    支持:  xxx.workers.dev
+           https://xxx.workers.dev
+           https://xxx.workers.dev/check
+           https://xxx.workers.dev/check?sstp=vpn:vpn@   (完整, 原样使用)
+    """
+    raw = raw.strip()
+    if "你的域名" in raw or not raw:
+        return raw
+    if not re.match(r"^https?://", raw, re.I):
+        raw = "https://" + raw
+    parts = urlsplit(raw)
+    if "sstp=" in parts.query:
+        return raw
+    path = parts.path.rstrip("/") or "/check"
+    return urlunsplit((parts.scheme, parts.netloc, path, "sstp=vpn:vpn@", ""))
+
+
+WORKER_CHECK_URL = normalize_worker_url(env_str("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@"))
 CONCURRENCY = max(1, env_num("CHECK_CONCURRENCY", 32))
 CHECK_TIMEOUT = env_num("CHECK_TIMEOUT", 90.0, float)
 MAX_CHECK_NODES = env_num("MAX_CHECK_NODES", 0)
@@ -391,7 +413,15 @@ def check_one(node, session):
                 out["error"] = f"HTTP {r.status_code}"
                 out["worker_error"] = True
                 continue
-            j = r.json()
+            try:
+                j = r.json()
+            except ValueError:
+                snippet = " ".join((r.text or "").split())[:150]
+                ctype = r.headers.get("Content-Type", "?")
+                out["error"] = f"响应不是 JSON (HTTP {r.status_code}, {ctype}): {snippet or '<空>'}"
+                out["worker_error"] = True
+                j = None
+                continue
             if not isinstance(j, dict):
                 out["error"] = "Worker 返回了非 JSON 对象"
                 out["worker_error"] = True
@@ -562,6 +592,9 @@ def main():
         die("未配置检测 Worker: 请设置环境变量 CHECK_WORKER, "
             "例如 https://xxx.workers.dev/check?sstp=vpn:vpn@")
 
+    _u = urlsplit(WORKER_CHECK_URL)
+    log("CLOUDFLARE WORKER", f"检测接口: <域名已隐藏>{_u.path}?{_u.query}<节点>")
+
     session = requests.Session()
     adapter = HTTPAdapter(pool_connections=CONCURRENCY, pool_maxsize=CONCURRENCY)
     session.mount("https://", adapter)
@@ -600,8 +633,17 @@ def main():
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
     if uniq and len(worker_errors) == len(uniq):
-        sample = worker_errors[0].get("error")
-        die(f"Worker 全部请求异常, 检测服务不可用 — 本次不覆盖已有结果 (示例错误: {sample})")
+        samples = []
+        for r in worker_errors:
+            e = r.get("error")
+            if e not in samples:
+                samples.append(e)
+            if len(samples) >= 3:
+                break
+        log("DEBUG", f"Worker 请求示例: {WORKER_CHECK_URL.split('?')[0]}?... + {worker_errors[0]['host']}:{worker_errors[0]['port']}")
+        for e in samples:
+            log("DEBUG", f"错误示例: {e}")
+        die("Worker 全部请求异常, 检测服务不可用 — 本次不覆盖已有结果")
     if not success:
         die("没有任何可用节点, 本次不覆盖已有结果")
 
