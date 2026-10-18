@@ -1,4 +1,6 @@
-VPN Gate SSTP 节点检测流水线 
+#!/usr/bin/env python3
+"""
+VPN Gate SSTP 节点检测流水线 (可本地运行版)
 ==========================================
 流程:
   1. 获取 VPN Gate 原始节点 (官方 API -> GitHub 镜像回退)
@@ -566,223 +568,11 @@ def build_outputs(results, raw_count, sstp_count, source):
         "sstp_nodes": sstp_count,
         "checked": len(results),
         "success": len(available),
-        "failed":   urls = [u.strip() for u in api_urls_str.split(",") if u.strip()]
-    for url in urls:
-        try:
-            log("OPTIMAL API", f"请求优选 API: {url}")
-            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                log("OPTIMAL API", f"API 返回状态码异常: {resp.status_code}")
-                continue
-            count = 0
-            for line in resp.text.strip().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                endpoint = line.split("#")[0].strip()
-                if not endpoint:
-                    continue
-                if ":" not in endpoint:
-                    endpoint = f"{endpoint}:443"
-                endpoints.append(endpoint)
-                count += 1
-            log("OPTIMAL API", f"成功从 API 获取到 {count} 个优选端点")
-        except Exception as e:
-            log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {e}")
-    return endpoints
-
-
-def get_combined_edge_hosts():
-    """合并静态优选域名与优选 API 端点 (去重, 保序)"""
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
-
-    api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
-
-    combined, seen = [], set()
-    for h in static_hosts + api_hosts:
-        if h and h not in seen:
-            seen.add(h)
-            combined.append(h)
-
-    log("EDGE POOL",
-        f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
-    return combined or list(EDGE_HOSTS)
-
-
-# ---------------------------------------------------------------------------
-# 筛选 SSTP 节点
-# ---------------------------------------------------------------------------
-_PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
-_REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
-
-
-def to_sstp_nodes(rows):
-    nodes = []
-    for r in rows:
-        cfg = ""
-        if r["config_b64"]:
-            try:
-                cfg = base64.b64decode(r["config_b64"], validate=False).decode("utf-8", "replace")
-            except Exception:
-                cfg = ""
-        if not _PROTO_TCP_RE.search(cfg):
-            continue
-        m = _REMOTE_RE.search(cfg)
-        if not m:
-            continue
-        port = int(m.group(1))
-        if not (1 <= port <= 65535):
-            continue
-        host = r["host"]
-        if not host.endswith(".opengw.net"):
-            host = f"{host}.opengw.net"
-        nodes.append({
-            "host": host, "port": port, "ip": r["ip"],
-            "country": r["country_long"], "country_code": r["country_short"],
-        })
-    return nodes
-
-
-def dedupe(nodes):
-    seen, out = set(), []
-    for n in nodes:
-        key = (n["host"].lower(), n["port"], "sstp")
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(n)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 检测 Worker
-# ---------------------------------------------------------------------------
-def classify_network(host, exit_org, is_datacenter=None):
-    if is_datacenter is True:
-        return "datacenter"
-    if is_datacenter is False:
-        return "residential"
-    org = (exit_org or "").upper()
-    if org:
-        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS):
-            return "datacenter"
-        if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS):
-            return "residential"
-    h = host.lower()
-    if h.startswith("public-vpn"):
-        return "datacenter"
-    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h):
-        return "residential"
-    return "unknown"
-
-
-def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe=":")
-    out = dict(node)
-    out["protocol"] = "sstp"
-    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-    out["status"] = "failed"
-    out["success"] = False
-    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["exit"] = None
-    out["residential"] = "unknown"
-
-    # Worker 层面的异常 (网络错误 / 非 200) 重试一次
-    j = None
-    for attempt in range(2):
-        try:
-            r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-            if r.status_code != 200:
-                out["error"] = f"HTTP {r.status_code}"
-                out["worker_error"] = True
-                continue
-            try:
-                j = r.json()
-            except ValueError:
-                snippet = " ".join((r.text or "").split())[:150]
-                ctype = r.headers.get("Content-Type", "?")
-                out["error"] = f"响应不是 JSON (HTTP {r.status_code}, {ctype}): {snippet or '<空>'}"
-                out["worker_error"] = True
-                j = None
-                continue
-            if not isinstance(j, dict):
-                out["error"] = "Worker 返回了非 JSON 对象"
-                out["worker_error"] = True
-                j = None
-                continue
-            out.pop("worker_error", None)
-            break
-        except Exception as exc:
-            out["error"] = f"{type(exc).__name__}: {exc}"
-            out["worker_error"] = True
-            j = None
-    if j is None:
-        return out
-
-    ok = bool(j.get("success"))
-    out["success"] = ok
-    out["status"] = "success" if ok else "failed"
-    out["latency_ms"] = j.get("responseTime")
-    out["colo"] = j.get("colo")
-    out["error"] = None if ok else (j.get("error") or j.get("message") or "check failed")
-
-    exit_info = j.get("exit")
-    if isinstance(exit_info, dict) and exit_info:
-        asn = exit_info.get("asn")
-        if not isinstance(asn, dict):
-            asn = {"asn": asn} if asn else {}
-        org = asn.get("org") or asn.get("name") or ""
-        out["exit"] = {
-            "ip": exit_info.get("ip"),
-            "country": exit_info.get("country"),
-            "country_code": exit_info.get("country_code"),
-            "city": exit_info.get("city"),
-            "continent": exit_info.get("continent"),
-            "asn": asn.get("asn"),
-            "org": org,
-            "type": asn.get("type"),
-            "is_datacenter": exit_info.get("is_datacenter"),
-        }
-        out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-    else:
-        out["residential"] = classify_network(out["host"], None, None)
-    return out
-
-
-def check_all(nodes, session):
-    results = []
-    total = len(nodes)
-    step = max(1, total // 10)
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
-        for i, fut in enumerate(as_completed(futures), 1):
-            results.append(fut.result())
-            if i % step == 0 or i == total:
-                ok = sum(1 for r in results if r.get("success"))
-                log("CLOUDFLARE WORKER", f"进度 {i}/{total}, 目前成功 {ok}")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# 生成数据
-# ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
-    countries = {}
-    for n in available:
-        c = n.get("country") or "未知"
-        countries.setdefault(c, {"code": n.get("country_code") or "?", "nodes": []})["nodes"].append(n)
-
-    stats = {
-        "raw_nodes": raw_count,
-        "sstp_nodes": sstp_count,
-        "checked": len(results),
-        "success": len(available),
         "failed": len(results) - len(available),
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        "mode": "worker" if USE_WORKER else "local_tcp",
     }
     by_country = {}
     for name, grp in countries.items():
@@ -802,7 +592,6 @@ def build_outputs(results, raw_count, sstp_count, source):
 
 
 def build_nodes_text(data, edge_hosts):
-    """纯节点行 (无注释): 每行 = 入口地址#名字$sstp://..."""
     if not edge_hosts:
         edge_hosts = list(EDGE_HOSTS)
     if not edge_hosts:
@@ -835,14 +624,65 @@ def build_nodes_text(data, edge_hosts):
     return "\n".join(lines) + "\n"
 
 
-_FALLBACK_HTML = (
-    "<!doctype html><html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head>"
-    "<body><h1>VPN Gate SSTP 节点</h1><pre id='out'></pre>"
-    "<script>fetch('data.json').then(r=>r.json())"
-    ".then(d=>{document.getElementById('out').textContent=JSON.stringify(d.stats,null,2)})"
-    ".catch(e=>{document.getElementById('out').textContent='加载失败: '+e})</script>"
-    "</body></html>"
-)
+_FALLBACK_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN Gate SSTP 节点</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; background: #0f172a; color: #e2e8f0; }
+  h1 { color: #38bdf8; }
+  .card { background: #1e293b; border-radius: 12px; padding: 1.25rem; margin: 1rem 0; }
+  .stat { display: inline-block; margin-right: 1.5rem; }
+  .stat b { color: #4ade80; font-size: 1.4rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; font-weight: 500; }
+  .ok { color: #4ade80; }
+  .fail { color: #f87171; }
+  a { color: #38bdf8; }
+</style>
+</head>
+<body>
+  <h1>VPN Gate SSTP 节点</h1>
+  <div class="card" id="stats">加载中...</div>
+  <div class="card">
+    <h2>可用节点</h2>
+    <div id="nodes">加载中...</div>
+  </div>
+  <script>
+    fetch('data.json')
+      .then(r => r.json())
+      .then(d => {
+        const s = d.stats;
+        document.getElementById('stats').innerHTML = `
+          <div class="stat">原始节点 <b>${s.raw_nodes}</b></div>
+          <div class="stat">SSTP <b>${s.sstp_nodes}</b></div>
+          <div class="stat">检测 <b>${s.checked}</b></div>
+          <div class="stat">成功 <b class="ok">${s.success}</b></div>
+          <div class="stat">国家/地区 <b>${s.countries}</b></div>
+          <div class="stat">模式 <b>${s.mode || '-'}</b></div>
+          <p style="margin-top:0.75rem;color:#94a3b8">生成时间: ${d.generated_at} | 来源: ${d.source}</p>
+        `;
+        const rows = (d.available || []).map(n => `
+          <tr>
+            <td>${n.country || '-'} (${n.country_code || '?'})</td>
+            <td>${n.host}:${n.port}</td>
+            <td>${n.latency_ms != null ? n.latency_ms + ' ms' : '-'}</td>
+            <td>${n.residential || 'unknown'}</td>
+          </tr>`).join('');
+        document.getElementById('nodes').innerHTML = rows
+          ? `<table><thead><tr><th>国家</th><th>节点</th><th>延迟</th><th>类型</th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<p class="fail">暂无可用节点</p>';
+      })
+      .catch(e => {
+        document.getElementById('stats').innerHTML = `<p class="fail">加载失败: ${e}</p>`;
+      });
+  </script>
+</body>
+</html>
+"""
 
 
 def write_outputs(data, edge_hosts):
@@ -872,37 +712,57 @@ def write_outputs(data, edge_hosts):
 # main
 # ---------------------------------------------------------------------------
 def main():
-    if "你的域名" in WORKER_CHECK_URL or not WORKER_CHECK_URL.startswith(("http://", "https://")):
-        die("未配置检测 Worker: 请设置环境变量 CHECK_WORKER, "
-            "例如 https://xxx.workers.dev/check?sstp=vpn:vpn@")
+    parser = argparse.ArgumentParser(description="VPN Gate SSTP 节点检测流水线")
+    parser.add_argument("--local", action="store_true", help="强制使用本地 TCP 检测")
+    parser.add_argument("--max", type=int, default=None, help="最多检测节点数")
+    parser.add_argument("--concurrency", type=int, default=None, help="并发数")
+    parser.add_argument("--timeout", type=float, default=None, help="单节点超时秒数")
+    args = parser.parse_args()
 
-    _u = urlsplit(WORKER_CHECK_URL)
-    log("CLOUDFLARE WORKER", f"检测接口: <域名已隐藏>{_u.path}?{_u.query}<节点>")
+    global USE_WORKER, CONCURRENCY, CHECK_TIMEOUT, MAX_CHECK_NODES
 
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=CONCURRENCY, pool_maxsize=CONCURRENCY)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    if args.local:
+        USE_WORKER = False
+    if args.max is not None:
+        MAX_CHECK_NODES = args.max
+    if args.concurrency is not None:
+        CONCURRENCY = max(1, args.concurrency)
+    if args.timeout is not None:
+        CHECK_TIMEOUT = args.timeout
+
+    if USE_WORKER:
+        _u = urlsplit(WORKER_CHECK_URL)
+        log("MODE", f"检测模式: Cloudflare Worker → {_u.netloc}{_u.path}")
+    else:
+        log("MODE", "检测模式: 本地 TCP 连通性检测 (无需 Worker)")
+        log("MODE", "提示: 设置环境变量 CHECK_WORKER 可启用完整 Worker 检测")
+
+    session = None
+    if USE_WORKER:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=CONCURRENCY, pool_maxsize=CONCURRENCY)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
 
     rows, source = fetch_vpngate()
     raw_count = len(rows)
     if raw_count == 0:
-        die("VPN Gate 返回 0 个原始节点 (数据源异常, 不允许生成空结果)")
+        die("VPN Gate 返回 0 个原始节点 (数据源异常)")
 
     sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
-        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化, 需要人工适配")
-    uniq = dedupe(sstp_nodes)
+        die(f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点 — 数据格式可能已变化")
 
+    uniq = dedupe(sstp_nodes)
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
+        log("VPN GATE", f"已限制检测数量为前 {MAX_CHECK_NODES} 个")
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
-    log("VPN GATE", f"去重后: {len(uniq)}")
+    log("VPN GATE", f"去重后待检测: {len(uniq)}")
 
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
     results = check_all(uniq, session)
     elapsed = time.time() - t0
@@ -911,12 +771,11 @@ def main():
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
 
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER",
-        f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+    log("CHECK", f"检测成功: {len(success)}")
+    log("CHECK", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
+    log("CHECK", f"耗时: {elapsed:.1f}s")
 
-    if uniq and len(worker_errors) == len(uniq):
+    if USE_WORKER and uniq and len(worker_errors) == len(uniq):
         samples = []
         for r in worker_errors:
             e = r.get("error")
@@ -924,11 +783,12 @@ def main():
                 samples.append(e)
             if len(samples) >= 3:
                 break
-        log("DEBUG", f"Worker 请求示例: {WORKER_CHECK_URL.split('?')[0]}?... + {worker_errors[0]['host']}:{worker_errors[0]['port']}")
         for e in samples:
             log("DEBUG", f"错误示例: {e}")
         die("Worker 全部请求异常, 检测服务不可用 — 本次不覆盖已有结果")
-    if not success:
+
+    # 本地模式下即使没有成功节点也允许生成空结果（方便调试）
+    if not success and USE_WORKER:
         die("没有任何可用节点, 本次不覆盖已有结果")
 
     data = build_outputs(results, raw_count, sstp_count, source)
@@ -942,6 +802,8 @@ def main():
     log("OUTPUT", f"已生成: {html_path}")
     log("OUTPUT", f"已生成: {nodes_path}")
     log("OUTPUT", f"订阅地址: {NODES_URL}")
+    if not success:
+        log("OUTPUT", "注意: 本次没有检测到可用节点 (本地模式仍已写出文件)")
 
 
 if __name__ == "__main__":
